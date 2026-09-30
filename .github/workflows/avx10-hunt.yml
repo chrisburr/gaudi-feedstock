@@ -9,6 +9,13 @@ name: avx10-hunt
 # because a CPUID dump paired with a real warning on one host is the deliverable
 # and a hit whose job stopped early is wasted.
 on:
+  # GitHub only honours workflow_dispatch and schedule for workflows on the
+  # default branch, and this lives on a side branch of the fork, so pushing is
+  # the trigger. The schedule below will NOT fire from here - moving this file
+  # to the fork's default branch is what would enable the repeated sampling the
+  # experiment wants.
+  push:
+    branches: [avx10-hunt]
   workflow_dispatch:
     inputs:
       samples:
