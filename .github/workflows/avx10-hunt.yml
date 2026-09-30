@@ -1,0 +1,102 @@
+name: avx10-hunt
+
+# Diagnostic experiment for root-project/root#23542. Not part of the feedstock
+# build; lives on a branch of the fork and must never reach conda-forge/.
+#
+# Stage 1 samples the runner fleet cheaply: dump CPUID, ask LLVM 20 what it
+# derives, and run a real Cling process to see whether it warns. Stage 2 fires
+# only on a hit and builds Gaudi with its full test suite on that same machine,
+# because a CPUID dump paired with a real warning on one host is the deliverable
+# and a hit whose job stopped early is wasted.
+on:
+  workflow_dispatch:
+    inputs:
+      samples:
+        description: "Runners to sample"
+        default: "40"
+  schedule:
+    # the target configuration is evidently rare, so keep sampling the fleet
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.g.outputs.matrix }}
+    steps:
+      - id: g
+        run: echo "matrix=$(seq 1 ${{ inputs.samples || '40' }} | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+  hunt:
+    needs: plan
+    # same label as the job that originally warned
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        sample: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          run-install: false
+
+      - name: Stage 1 - collect
+        id: probe
+        env:
+          OUT: avx10-artifacts
+        run: bash avx10/collect.sh
+
+      # Artifacts rather than log scraping: logs expire and get truncated, and
+      # this is the evidence.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: probe-${{ matrix.sample }}
+          path: avx10-artifacts/
+          if-no-files-found: warn
+
+      # ---- Stage 2: only on a hit, and it must run to completion ----
+      - name: Stage 2 - build Gaudi on the affected machine
+        if: steps.probe.outputs.hit == 'yes'
+        env:
+          CI: github_actions
+          CONFIG: linux_64_clhep2.4.4.0python3.13.____cp313root_base6.36.14root_cxx_standard20
+          DOCKER_IMAGE: quay.io/condaforge/linux-anvil-x86_64:alma10
+          MINIFORGE_HOME: ~/miniforge3
+          UPLOAD_PACKAGES: "False"
+          IS_PR_BUILD: "True"
+          RATTLER_BUILD_COLOR: always
+        shell: bash
+        run: |
+          # no set -e: the test suite must run to the end even after the first
+          # failure, so we get the complete warning count and failing-test list
+          export FEEDSTOCK_NAME="$(basename "$GITHUB_REPOSITORY")"
+          export GIT_BRANCH="${GITHUB_REF_NAME}"
+          export MINIFORGE_HOME="${MINIFORGE_HOME/#~/${HOME}}"
+          export CONDA_BLD_PATH="${HOME}/build_artifacts"
+          ./.scripts/run_docker_build.sh 2>&1 | tee avx10-artifacts/gaudi-build.log
+          echo "build pipeline status: ${PIPESTATUS[0]}"
+          grep -c "invalid feature combination" avx10-artifacts/gaudi-build.log \
+            | sed 's/^/AVX10 warnings in the Gaudi build: /'
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.probe.outputs.hit == 'yes'
+        with:
+          name: HIT-${{ matrix.sample }}
+          path: avx10-artifacts/
+          if-no-files-found: warn
+
+      - name: Summarise
+        if: always()
+        run: |
+          printf '| %s | %s | %s | **%s** |\n' \
+            "${{ matrix.sample }}" \
+            "$(cat avx10-artifacts/model.txt 2>/dev/null)" \
+            "$(cat avx10-artifacts/archspec.txt 2>/dev/null)" \
+            "${{ steps.probe.outputs.hit || 'error' }}" >> "$GITHUB_STEP_SUMMARY"
